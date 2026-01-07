@@ -7,21 +7,31 @@
     <property name="build" value="build/"/>
     <property name="src"   value="src/"/>
     <property name="jar"   value="zetatwofactorauth.jar"/>
+    
+    <property name="zimbra.jars" value="/opt/zimbra/lib/jars"/>
+    <property name="zimbra.common" value="/opt/zimbra/common/lib"/>
 
     <path id="libraries">
-        <fileset dir="${lib}" >
+        <fileset dir="${lib}" erroronmissingdir="false">
             <include name="*.jar"/>
+        </fileset>
+        
+        <fileset dir="${zimbra.jars}">
+            <include name="*.jar"/>
+        </fileset>
+        
+        <fileset dir="${zimbra.common}" erroronmissingdir="false">
+             <include name="*.jar"/>
         </fileset>
     </path>
 
     <target name="clean">
       <delete dir="${build}"/>
-      <delete file="zetatwofactorauth.jar"/>
+      <delete file="${jar}"/>
       <mkdir dir="${build}"/>
     </target>
 
-    <target name="compile"
-            depends="clean">
+    <target name="compile" depends="clean">
         <javac srcdir="${src}"
                destdir="${build}"
                includeantruntime="false"
@@ -35,13 +45,15 @@
         </javac>
     </target>
 
-    <target name="jar"
-            depends="compile">
+    <target name="jar" depends="compile">
         <jar jarfile="${jar}"
              compress="false"
              basedir="${build}">
             <manifest>
                 <attribute name="Zimbra-Extension-Class" value="com.btactic.twofactorauth.TwoFactorAuthExtension" />
+                <attribute name="Implementation-Vendor" value="BTactic"/>
+                <attribute name="Implementation-Title" value="Zimbra 2FA Extension"/>
+                <attribute name="Implementation-Version" value="1.0"/>
             </manifest>
             <fileset dir="${build}" />
         </jar>

@@ -51,10 +51,7 @@ public abstract class BaseTwoFactorAuthComponent {
      * @throws IllegalArgumentException if account is null
      */
     protected BaseTwoFactorAuthComponent(Account account) throws ServiceException {
-        if (account == null) {
-            throw new IllegalArgumentException("Account cannot be null");
-        }
-        this(account, account.getName());
+        this(account, account == null ? null : account.getName());
     }
 
     /**

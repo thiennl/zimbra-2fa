@@ -19,12 +19,11 @@
  */
 package com.btactic.twofactorauth;
 
-import java.util.Arrays;
 import java.util.ArrayList;
-import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.security.SecureRandom;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Strings;
@@ -46,8 +45,8 @@ import com.zimbra.cs.account.Account;
 import com.zimbra.cs.account.AccountServiceException.AuthFailedServiceException;
 import com.btactic.twofactorauth.app.ZetaAppSpecificPassword;
 import com.btactic.twofactorauth.app.ZetaAppSpecificPasswords;
-import com.btactic.twofactorauth.core.BaseTwoFactorAuthComponent;
 import com.btactic.twofactorauth.core.EmailCodeParser;
+import com.btactic.twofactorauth.core.EmailCodeParser.EmailCodeData;
 import com.btactic.twofactorauth.core.TwoFactorAuthConstants;
 import com.btactic.twofactorauth.core.TwoFactorAuthUtils;
 import com.btactic.twofactorauth.credentials.CredentialGenerator;
@@ -56,18 +55,16 @@ import com.btactic.twofactorauth.exception.TwoFactorCodeExpiredException;
 import com.btactic.twofactorauth.exception.TwoFactorCodeInvalidException;
 import com.btactic.twofactorauth.exception.TwoFactorCredentialException;
 import com.btactic.twofactorauth.exception.TwoFactorCredentialException.CredentialErrorType;
-import com.btactic.twofactorauth.service.exception.SendTwoFactorAuthCodeException;
 import com.btactic.twofactorauth.trusteddevices.ZetaTrustedDevices;
 import com.btactic.twofactorauth.ZetaScratchCodes;
 import com.zimbra.cs.account.Config;
+import com.zimbra.cs.account.DataSource;
 import com.zimbra.cs.account.Provisioning;
 import com.btactic.twofactorauth.trusteddevices.ZetaTrustedDevice;
 import com.btactic.twofactorauth.trusteddevices.ZetaTrustedDeviceToken;
 import com.zimbra.cs.account.ldap.ChangePasswordListener;
 import com.zimbra.cs.account.ldap.LdapLockoutPolicy;
-import com.zimbra.cs.ldap.LdapDateUtil;
 
-import org.apache.commons.lang.RandomStringUtils;
 
 /**
  * This class is the main entry point for two-factor authentication.
@@ -75,36 +72,83 @@ import org.apache.commons.lang.RandomStringUtils;
  * @author iraykin
  *
  */
-public class ZetaTwoFactorAuth extends BaseTwoFactorAuthComponent implements TwoFactorAuth {
+public class ZetaTwoFactorAuth extends TwoFactorAuth {
+    private final Account account;
+    private final String acctNamePassedIn;
     private String secret;
     private List<String> scratchCodes;
     boolean hasStoredSecret;
     boolean hasStoredScratchCodes;
     private Map<String, ZetaAppSpecificPassword> appPasswords = new HashMap<String, ZetaAppSpecificPassword>();
 
+    private static final char[] NUMERIC_CHARS = "0123456789".toCharArray();
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
     // Cached config for better performance
     private AuthenticatorConfig authenticatorConfig;
+    private Config globalConfig;
+    private Encoding secretEncoding;
+    private Encoding scratchEncoding;
 
     public ZetaTwoFactorAuth(Account account) throws ServiceException {
-        if (account == null) {
-            throw new IllegalArgumentException("Account cannot be null");
-        }
-        this(account, account.getName());
+        this(account, account == null ? null : account.getName());
     }
 
     public ZetaTwoFactorAuth(Account account, String acctNamePassedIn) throws ServiceException {
+        super(account, acctNamePassedIn);
         if (account == null) {
             throw new IllegalArgumentException("Account cannot be null");
         }
         if (Strings.isNullOrEmpty(acctNamePassedIn)) {
             throw new IllegalArgumentException("Account name cannot be null or empty");
         }
-
-        super(account, acctNamePassedIn);
+        this.account = account;
+        this.acctNamePassedIn = acctNamePassedIn;
         TwoFactorAuthUtils.disableTwoFactorAuthIfNecessary(account);
         if (account.isFeatureTwoFactorAuthAvailable()) {
             secret = loadSharedSecret();
         }
+    }
+
+    private Config getGlobalConfig() throws ServiceException {
+        if (globalConfig == null) {
+            globalConfig = Provisioning.getInstance().getConfig();
+        }
+        return globalConfig;
+    }
+
+    private Encoding getSecretEncoding() throws ServiceException {
+        if (secretEncoding == null) {
+            try {
+                String enc = getGlobalConfig().getTwoFactorAuthSecretEncodingAsString();
+                secretEncoding = Encoding.valueOf(enc);
+            } catch (IllegalArgumentException e) {
+                ZimbraLog.account.warn("Invalid secret encoding, defaulting to BASE32", e);
+                secretEncoding = Encoding.BASE32;
+            }
+        }
+        return secretEncoding;
+    }
+
+    private Encoding getScratchCodeEncoding() throws ServiceException {
+        if (scratchEncoding == null) {
+            try {
+                String enc = getGlobalConfig().getTwoFactorAuthScratchCodeEncodingAsString();
+                scratchEncoding = Encoding.valueOf(enc);
+            } catch (IllegalArgumentException e) {
+                ZimbraLog.account.warn("Invalid scratch code encoding, defaulting to BASE32", e);
+                scratchEncoding = Encoding.BASE32;
+            }
+        }
+        return scratchEncoding;
+    }
+
+    private String encrypt(String data) throws ServiceException {
+        return DataSource.encryptData(account.getId(), data);
+    }
+
+    private static String decrypt(Account account, String encrypted) throws ServiceException {
+        return DataSource.decryptData(account.getId(), encrypted);
     }
 
     public static class AuthFactory implements Factory {
@@ -348,16 +392,42 @@ public class ZetaTwoFactorAuth extends BaseTwoFactorAuthComponent implements Two
         boolean success = false;
         String codeType = "unknown";
 
-        if (isTOTPCode(code)) {
-          codeType = "TOTP";
-          success = checkTOTPCode(code);
-        } else if (isEmailCode(code)) {
-          codeType = "Email";
-          success = checkEmailCode(code);
-        } else if (isScratchCode(code)) {
-          codeType = "Scratch";
-          ZetaScratchCodes scratchCodesManager = new ZetaScratchCodes(account);
-          success = scratchCodesManager.checkScratchCodes(code);
+        boolean totpCandidate = isTOTPCode(code);
+        boolean emailCandidate = isEmailCode(code);
+        boolean scratchCandidate = isScratchCode(code);
+        boolean appEnabled = isEnabledMethod(AccountConstants.E_TWO_FACTOR_METHOD_APP);
+        boolean emailEnabled = isEnabledMethod(AccountConstants.E_TWO_FACTOR_METHOD_EMAIL);
+
+        if (totpCandidate && emailCandidate) {
+            boolean emailTried = false;
+            ServiceException emailFailure = null;
+            if (emailEnabled && hasStoredEmailCode()) {
+                try {
+                    codeType = "Email";
+                    success = checkEmailCode(code);
+                    emailTried = true;
+                } catch (ServiceException e) {
+                    emailTried = true;
+                    emailFailure = e;
+                }
+            }
+            if (!success && appEnabled) {
+                codeType = "TOTP";
+                success = checkTOTPCode(code);
+            }
+            if (!success && !appEnabled && emailEnabled && emailTried && emailFailure != null) {
+                throw emailFailure;
+            }
+        } else if (totpCandidate && appEnabled) {
+            codeType = "TOTP";
+            success = checkTOTPCode(code);
+        } else if (emailCandidate && emailEnabled) {
+            codeType = "Email";
+            success = checkEmailCode(code);
+        } else if (scratchCandidate) {
+            codeType = "Scratch";
+            ZetaScratchCodes scratchCodesManager = new ZetaScratchCodes(account);
+            success = scratchCodesManager.checkScratchCodes(code);
         }
 
         if (!success) {
@@ -425,7 +495,7 @@ public class ZetaTwoFactorAuth extends BaseTwoFactorAuthComponent implements Two
      * @throws ServiceException if account attributes cannot be read
      */
     public boolean isEnabledMethod(String twoFactorAuthMethodEnabled) throws ServiceException {
-        if (twoFactorAuthMethodEnabled == AccountConstants.E_TWO_FACTOR_METHOD_APP) {
+        if (AccountConstants.E_TWO_FACTOR_METHOD_APP.equals(twoFactorAuthMethodEnabled)) {
             if (internalIsEnabledMethod(twoFactorAuthMethodEnabled)) {
                 return true;
             } else {
@@ -608,7 +678,7 @@ public class ZetaTwoFactorAuth extends BaseTwoFactorAuthComponent implements Two
 
     public void storeEmailCode() throws ServiceException {
         int emailCodeLength = getGlobalConfig().getTwoFactorAuthEmailCodeLength();
-        String emailCode = RandomStringUtils.randomNumeric(emailCodeLength);
+        String emailCode = generateNumericCode(emailCodeLength);
 
         String reserved = ""; // Reserved for future use
         long timestamp = System.currentTimeMillis();
@@ -630,6 +700,26 @@ public class ZetaTwoFactorAuth extends BaseTwoFactorAuthComponent implements Two
         EmailCodeData emailData = parseEmailCodeData();
         long emailLifeTime = account.getTwoFactorCodeLifetimeForEmail();
         return emailData.getTimestamp() + emailLifeTime;
+    }
+
+    private EmailCodeData parseEmailCodeData() throws ServiceException {
+        return EmailCodeParser.parse(account, acctNamePassedIn);
+    }
+
+    private boolean hasStoredEmailCode() {
+        String encryptedEmailData = account.getTwoFactorCodeForEmail();
+        return !Strings.isNullOrEmpty(encryptedEmailData);
+    }
+
+    private String generateNumericCode(int length) {
+        if (length <= 0) {
+            throw new IllegalArgumentException("Code length must be positive, got: " + length);
+        }
+        char[] code = new char[length];
+        for (int i = 0; i < length; i++) {
+            code[i] = NUMERIC_CHARS[SECURE_RANDOM.nextInt(NUMERIC_CHARS.length)];
+        }
+        return new String(code);
     }
 
     public static class TwoFactorPasswordChange extends ChangePasswordListener {

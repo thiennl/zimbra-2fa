@@ -131,6 +131,14 @@ public class ZetaScratchCodes extends BaseTwoFactorAuthComponent implements Scra
         }
     }
 
+    public boolean twoFactorAuthEnabled() throws ServiceException {
+        if (twoFactorAuthRequired()) {
+            String secret = account.getTwoFactorAuthSecret();
+            return !Strings.isNullOrEmpty(secret);
+        }
+        return false;
+    }
+
     /**
      * Checks if the provided scratch code is valid and invalidates it if found.
      * Uses Iterator for efficient removal to avoid ConcurrentModificationException
